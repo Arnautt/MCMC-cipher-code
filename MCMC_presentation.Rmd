@@ -1,0 +1,437 @@
+---
+title: "Déchiffrage par méthode MCMC"
+date: "12 avril - Kerian Rozier et Arnaud Trog"
+output: html_document
+runtime: shiny
+---
+
+
+```{r setup, include=FALSE, echo = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+list_of_packages <- c("ggplot2", "reshape2", "knitr", "gridExtra")
+new_packages <- list_of_packages[!(list_of_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+library(shiny)
+library(ggplot2)
+library(reshape2)
+library(knitr)
+library("gridExtra")
+alphabet <- toupper(letters)
+alphabet_with_space = c(alphabet, " ")
+load("M_trans.Rdata")
+load("df.Rdata")
+```
+
+
+
+```{r, echo=FALSE}
+antecedent <- function(mylist, x) {                       # Retrouve l'antécedent de x dans une liste
+  names(mylist[mylist[]==x]) 
+}
+
+
+decoder <- function(code, to_decode) {                    # Fonction qui décode avec code le chiffrage to_decode
+  to_decode = toupper(to_decode)                          # On travaille uniquement avec des majuscules et l'espace
+  decoded = to_decode                                     # résultat final que l'on complètera
+  N <- nchar(to_decode)
+  for (i in 1:N) {                                        # pour chaque caractère du message chiffré, on regarde son antécédent par 'code'
+    old_char <- substring(to_decode,i,i)                  # et on le rempace dans decoded
+    if (old_char %in% alphabet) {
+      new_char <- antecedent(code, old_char)
+      substring(decoded,i,i) = new_char
+    }
+    else {substring(decoded,i,i) = " "}
+  }
+  decoded
+}
+
+
+
+log_plaus <- function(decoded) {                # log-plausibilité d'observer un message décodé
+                                                # (plus tard, nous déchiffrons le message avec un certain code)
+  res = 0                                       # cela revient donc à donner la log-plausibilité de ce code
+  N = nchar(decoded)
+  s1 = substring(decoded,1,1)
+  idx1 = match(s1, alphabet_with_space)
+  res = res + log(M_trans[27, idx1])
+  
+  for (i in 1:(N-1)) {                          # pour chaque lettre dans le message décodé
+    s1 = substring(decoded,i,i)                 # on ajoute la log-probabilité de passer de x à x+1
+    s2 = substring(decoded,i+1,i+1)
+    idx1 = match(s1, alphabet_with_space)
+    idx2 = match(s2, alphabet_with_space)
+    res = res + log(M_trans[idx1, idx2])
+  }
+  
+  res = res + log(M_trans[idx2, 27])
+  res
+  
+}
+
+
+new_prop <- function(code) {   
+                                               # Fonction qui propose un voisin de code
+  prop_code <- code  
+  rdm_idx <- sample(1:26,2)                    # On choisit des indices aléatoires à permuter
+  to_switch_1 <- code[[rdm_idx[1]]]            # et on switch ces deux valeurs
+  to_switch_2 <- code[[rdm_idx[2]]]            # pour proposer un nouveau code prop_code
+  prop_code[[rdm_idx[1]]] <- to_switch_2       # si sa log-plausibilité est > à celle en cours on accepte
+  prop_code[[rdm_idx[2]]] <- to_switch_1       # sinon on accepte avec proba = ratio des deux plausibilités
+  prop_code
+  
+}
+
+
+initialization <- function() {
+  init.code <- list()
+  init_code_shuffle <- sample(alphabet)
+  j=1
+  for (letr in alphabet) {
+    init.code[letr] <- init_code_shuffle[j]
+    j = j + 1
+  }
+  init.code
+}
+
+
+accuracy <- function(decoded, true_txt) {
+  res = 0
+  N <- nchar(true_txt)
+  for (i in 1:N) {
+    true_char <- substring(true_txt,i,i)
+    decoded_char <- substring(decoded,i,i)
+    if (true_char == decoded_char) {res = res + 1}
+  }
+  res = res / N
+  res
+}
+
+````
+
+# Introduction
+
+Dans de nombreux problèmes mathématiques, l'objectif est de simuler des données selon une certaine loi. Cela permet par exemple d'approximer des intégrales multiples sans solutions explicites. Mais dans certains cas, nous ne pouvons pas le faire car il est difficile d'accéder à la constante de normalisation associée à cette loi. L'algorithme de Metropolis nous permet dans ce cas de simuler des données selon cette loi, sans connaître sa forme exacte. Plus précisément, cet algorithme permet de simuler selon une loi $\pi$ de la forme :
+
+$$ \pi(x) = \frac{\mu(x)}{\sum_{y}\mu(y)}$$
+
+
+sans connaître la quantité au dénominateur, qui peut être très compliquée à calculer. Il nous suffit de connaître la forme de $\mu$ pour échantillonner selon $\pi$ !
+
+Cette technique est particulièrement utile en statistiques bayésiennes, où l'on cherche à déterminer la loi a posteriori que nous connaissons seulement à un facteur multiplicatif près, ou encore en génétique. Dans notre cas, nous allons voir en quoi il peut servir à décrypter un message codé.
+
+
+
+
+
+# Présentation générale de l'algorithme
+
+L'objectif de l'algortihme est de construire une chaîne de Markov $(X_n)_{n\geqslant1}$ sur un espace d'états $E$ ayant comme mesure invariante $\pi$, qui représente notre loi à étudier. Ainsi, en temps long, les réalisations de cette chaîne seront proches des réalisations de la loi $\pi$. Plus précisément, l'agorithme de Metropolis-Hastings se construit comme suit :
+
+
+
+1. On choisit une matrice de proposition $P$, qui permet de parcourir l'espace d'états $E$. Cette matrice doit être stochastique, irréductible et vérifiant la condition suivante : 
+$$ \forall x,y \in E, \; P(x,y) > 0 \iff P(y,x) > 0 $$
+De plus, on définit le ratio de Metropolis par : 
+$$ \rho(x,y) = min\left\{\frac{\mu(y)P(y,x)}{\mu(x)P(x,y)}, 1\right\} $$
+
+2. On part d'un certain $x_0 \in E$ et à chaque itération $t$, on propose un voisin $y$ de $x_{t}$ avec probabilité $P(x_{t},y) > 0$.
+
+3. Avec probabilité $\rho(x_{t},y)$, on accepte cet état et donc $x_{t+1} = y$. Sinon la chaîne reste en l'état actuel $x_t$.
+
+
+Dans le cas où l'espace d'états est fini et $P$ vérifie la condition de Doeblin, alors cette chaîne $(X_n)_{n\geqslant1}$ ainsi construite converge en variation totale vers $\pi$ qui est son unique probabilité invariante. Autrement dit, la loi asymptotique de la chaîne est exactement notre loi d'intérêt $\pi$.
+
+Avant de voir comment fonctionne l'algorithme pour le déchiffrage, nous pouvons illustrer l'algorithme avec un exemple plus simple. Supposons que l'on veuille simuler des données selon une loi normale standard, sans que nous sachions le faire explicitement. Nous pouvons utiliser cet algorithme où $\pi = \mathcal{N}(0,1)$. Comme cette loi est continue, nous nous plaçons dans un cadre plus général où $P$ n'est pas une matrice mais un noyau de transition, cependant le principe reste le même. Dans ce cas, nous commençons la chaîne en $x_0 \in \mathbb{R}$ et à chaque itération $t$, nous proposons un voisin $x_{t+1} = x_t + Unif(-\alpha,\alpha)$. Cette chaîne ainsi construite admet pour mesure invariante la loi $\mathcal{N}(0,1)$. Nous pouvons le voir graphiquement à l'aide des deux représentations suivantes :
+
+```` {r,  echo = F}
+rnorm_mcmc <- function (x0, N_iter, alpha) {
+  res <- vector("numeric", N_iter)
+  x <- x0
+  res[1] <- x
+  for (i in 2:N_iter) {
+    prop <- x + runif(1, -alpha, alpha)
+    aprob <- min(1, dnorm(prop)/dnorm(x))
+    u <- runif(1)
+    if (u < aprob) {x <- prop}
+    res[i] <- x
+  }
+  res  
+}
+
+````
+
+```` {r,  echo = F}
+
+ui <- fluidPage( fluidRow(column(width = 4, sliderInput("x0", "Choisir x0 :", min = -10, max = 10, value = 0)),
+                          column(width = 4, sliderInput("N", "Nombre d'itérations :", min = 500, max = 20000, value = 2000)),
+                          column(width = 4, sliderInput("alpha", "Choisir alpha :", min = 0, max = 10, value = 2))
+                          ),
+                          
+                 fluidRow(plotOutput("plot1"))
+
+                 
+                 )
+
+
+
+
+server <- function(input, output) {
+  
+ 
+   output$plot1 <- renderPlot({
+      res <- rnorm_mcmc(input$x0, input$N, input$alpha)
+      df <- data.frame(N = 1:input$N, chain = res)
+   
+  
+     p1 <- ggplot(df, aes(x = N, y = chain)) + 
+            geom_line() +
+            ggtitle("Valeurs de la chaîne : ") +
+            xlab("") +
+            ylab("")
+
+     
+     p2 <- ggplot(data=df, aes(df$chain)) + 
+            geom_histogram(aes(y=..density..)) +
+            stat_function(fun = dnorm, colour = "red") +
+            ggtitle("") +
+            xlab("") +
+            ylab("")
+     
+     grid.arrange(p1, p2, nrow=2, ncol=1)
+     
+   
+   })
+   
+
+}
+
+
+shinyApp(ui, server, options = list(height = 500))
+
+````
+
+
+
+
+# MCMC et déchiffrage
+
+Afin de bien définir notre problème, commençons par expliciter certaines notations. Dans toute la suite, l'espace d'états $E$ est l'ensemble des chiffrages (ou codes) possibles. Un élement de $E$, noté $f$ peut être vu comme une fonction de l'espace de codage vers l'alphabet. Ci-dessous, voici un exemple pour mieux comprendre comment cela fonctionne :
+
+***
+````{r, echo = FALSE}
+kable(df)
+````
+***
+
+En première ligne, nous avons le message que nous voulons décrypter, auquel nous n'avons pas accès. L'objectif final est donc de le retrouver. Pour cela, nous avons uniquement accès au message chiffré (en ligne 3). Si l'on arrive à retrouver le chiffrage original (en ligne 4), nous avons donc le message original. Tout le but de l'algorithme est alors de le retrouver.
+Dans cet exemple, le code se comprend comme suit : chaque lettre est changée en une autre lettre à l'aide du code en ligne 2. Ainsi, s'il y a un "A" dans le texte, le code remplacera par un "T", s'il y a un "Z", ce sera remplacé par un "I" etc... La clé est donc la fonction inverse, ce qui permet de retrouver le message original.
+Ensuite, pour évaluer la qualité d'un code, nous devons définir une matrice de transition (ou des bigrammes). Celle-ci a été calculée à partir d'un texte de référence où l'on a parcouru l'ensemble des caractères. Nous avons ensuite enregistré les fréquences pour l'ensemble des paires de deux symboles consécutifs. Ainsi, par exemple, $M[1,3]$ représente la probabilité (liée au texte de référence !) d'observer un "C" après un "A".
+
+
+
+On peut désormais définir le score d'un code $f$ comme étant :
+
+$$ Sc(f) = \sum_{i \in \left\{1,...,|S|-1\right\}} log(M[f(s_i),f(s_{i+1})])$$
+
+Le score d'un chiffrage $f$ représente donc la qualité de celui-ci par rapport à la matrice M. Nous voyons donc l'importance de bien l'initialiser car tout l'algorithme repose sur cette quantité. Plus intuitivement, pour calculer le score d'un codage, on parcourt les caractères $s$ du message chiffré que l'on décrypte à l'aide du code $f$ et on calcule l'ensemble des probabilités de transition d'une lettre à l'autre. Par exemple, si le code est totalement aléatoire, il se peut qu'il y ait dans le déchiffrage un "Q" suivi d'un "Z", ce qui n'arrive jamais en réalité. Le terme associé dans la somme sera donc très faible.
+
+
+
+Dans notre cas, l'espace d'états est l'ensemble des codes possibles : il y a $26!$ états qui est équivalent à $4*10^{26}$. Nous avons donc un espace d'états fini mais très grand, il est difficile de trouver le code le plus probable. Nous allons donc utiliser l'algorithme de Metropolis-Hastings, où la mesure de probabilité invariante est donnée par :
+$$ \forall f \in E, \; \pi(f) = \frac{Sc(f)}{\sum_{g} Sc(g)}$$ 
+
+Ici, chaque $f$ représente un code de 26 lettres. Il est alors très compliqué de calculer la constante de normalisation au dénominateur et donc l'algorithme de Metropolis-Hastings semble un bon choix pour simuler selon $\pi$. En temps long, la chaîne sera alors "probablement plus" dans un état ayant un score élevé et en particulier aura plus de chances de se trouver dans le bon code que l'on cherche car la distribution admet un pic en ce point. Dans ce cas précis, nous procédons ainsi :
+
+
+  
+
+__*Algorithme :*__
+
+1. Commencer avec un code généré aléatoirement, noté  $f$.
+2. Calculer Sc($f$), le score associé à ce code.
+3. Proposer un nouveau candidat $f^{*}$ en faisant une permutation aléatoire de deux valeurs de $f$.
+4. Si Sc($f^{*}$) $>$ Sc($f$), on accepte $f^{*}$. Sinon, on l'accepte avec une probabilité de $\frac{Sc(f^{*})}{Sc(f)}$.
+5. Répéter les étapes 1-4 jusqu'à atteindre un certain critère d'arrêt.
+
+Dans ce cas, comme l'espace d'états est fini et $P$ vérifie la condition de Doeblin (car apériodique), la chaîne va converger en variation totale vers $\pi$. De plus, elle est symétrique et donc le ratio de Metropolis est donné par : $$\rho(x,y) = min\left\{\frac{Sc(y)}{Sc(x)}, 1\right\}$$
+Ainsi, si $Sc(y) > Sc(x)$, $\rho(x,y) = 1$ et donc on accepte forcément le voisin proposé. Cela semble naturel dans notre contexte : si le score du nouveau code est supérieur à celui du code précédent, on l'accepte forcément. Sinon, on l'accepte avec une certaine probabilité, ce qui permet à l'algorithme de ne pas rester bloqué dans un optimum local.
+
+<br/>
+
+__*Remarques :*__
+
+- En pratique, nous devons choisir un nombre d'itérations de l'algorithme. Celui-ci peut prendre plus ou moins de temps à converger selon le code initial. Pour observer un résultat proche de la réalité, il se peut qu'il faille relancer l'algorithme plusieurs fois.
+
+- Pour trouver la matrice $M$, le texte de référence était le livre anglais "War and Peace". Les probabilités de transition des bigrammes sont différentes d'une langue à une autre et donc si le texte à décrypter est en français, l'algorithme ne vas pas converger.
+
+- Pour changer de texte à décrypter, celui-ci ne doit pas contenir de symboles spéciaux (',!:? etc...) ni d'accents.
+
+
+```{r, echo=FALSE}
+
+ui <- fluidPage(
+
+  titlePanel("Illustration de l'algorithme MCMC"),
+  
+  sidebarLayout(
+    
+    sidebarPanel(  
+      numericInput("N", "Nombre d'iterations : ", 5000, 1000, 20000, 100), 
+      textAreaInput("txt", "Texte à decoder : ", value = "ENTER HAMLET HAM TO BE OR NOT TO BE THAT IS THE QUESTION WHETHER TIS NOBLER IN THE MIND TO SUFFER THE SLINGS AND ARROWS OF OUTRAGEOUS FORTUNE OR TO TAKE ARMS AGAINST A SEA OF TROUBLES AND BY OPPOSING END", height=200, width = 250),
+      actionButton("goMCMC", "Lancer l'algorithme"),
+      hr()
+    ),
+    
+    
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Vraisemblance", plotOutput("plot")), 
+        tabPanel("Comparaison des textes", verbatimTextOutput("resultat_decoded")),
+        tabPanel("Bigrammes", plotOutput("plot2")),
+        tabPanel("Précision", plotOutput("plot3"))
+      )
+    )
+    
+  )
+)
+
+server <- function(input, output){
+  
+  res <- reactiveValues()
+  evol_plaus <- reactiveValues()
+  to_decode <- reactiveValues()
+  txt_list <- reactiveValues()
+  code <- reactiveValues()
+  decoded <- reactiveValues()
+  max_code <- reactiveValues()
+  prop_code <- reactiveValues()
+  prop_decode <- reactiveValues()
+  plausibility <- reactiveValues()
+  max_plausibility <- reactiveValues()
+  prop_plausibility <- reactiveValues()
+  evol_accuracy <- reactiveValues()
+  evol_plaus <- c()
+  evol_accuracy <- c()
+  
+  observeEvent(input$goMCMC, {
+    
+    input$goMCMC 
+    
+    init_code <- initialization()
+    to_decode <- decoder(init_code, input$txt)
+    txt_list$todecode <- to_decode
+    plausibility <- log_plaus(to_decode)
+    max_plausibility <- plausibility
+    max_code <- init_code                         
+    prop_code <- init_code                       
+    code <- init_code   
+    
+    txt_list$true <- toupper(input$txt)
+    i = 1
+
+
+    withProgress(message = 'Algorithme en cours : ', value = 0, {
+      
+      while (i <= input$N) {
+        
+        prop_code <- new_prop(code)
+        prop_decode <- decoder(prop_code, to_decode)
+        prop_plausibility <- log_plaus(prop_decode)
+        
+        if (prop_plausibility >= plausibility || log(runif(1)) <= prop_plausibility-plausibility) {
+          code <- prop_code
+          plausibility <- prop_plausibility
+          if (plausibility >= max_plausibility) {
+            max_code = code
+          }
+        }
+        
+        
+        decoded <- decoder(code, to_decode)
+        evol_plaus[i] <- log_plaus(decoded)
+        evol_accuracy[i] <- accuracy(decoded, input$txt)
+        i = i + 1
+        
+        
+        incProgress(1/input$N, detail = paste("iteration ", i))
+
+        
+      }
+
+      
+    })
+    
+    
+    txt_list$result <- decoder(max_code, to_decode)
+    
+    output$plot <- renderPlot({
+      df <- data.frame(nb = 1:(input$N), evol = evol_plaus)
+      p <- ggplot(data = df, aes(nb, evol), col = 1) +
+        geom_line() +
+        ggtitle("Evolution de la log-vraisemblance") +
+        xlab("Iterations") +
+        ylab("")
+      
+      print(p)
+
+    })
+    
+    
+    output$resultat_decoded <- renderPrint({
+      x <- paste("Texte initial :", txt_list$true, sep = "\t")
+      y <- paste("Texte crypté :", txt_list$todecode, sep = "\t")
+      z <- paste("Texte final :", txt_list$result, sep = "\t")
+      u <- paste(x, y, z, sep= "\n")
+      cat(u)
+    })
+
+    
+    
+    output$plot2 <- renderPlot({
+      A <- M_trans[1:26, 1:26]
+      ggplot(melt(A), aes(x = Var1, y = Var2)) + 
+        geom_tile(aes(fill=value)) + 
+        scale_fill_gradient(low="grey95", high="red") +
+        ggtitle("Matrice des bigrammes") +
+        labs(x="Lettre 1", y="Lettre 2") +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        theme_bw()
+    })
+    
+    
+    output$plot3 <- renderPlot({
+      df <- data.frame(nb = 1:input$N, accuracy = evol_accuracy)
+      ggplot(df, aes(nb, accuracy)) + 
+        geom_line() + 
+        ggtitle("Pourcentage de bonnes lettres") +
+        labs(x="Iterations") +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        theme_bw()
+    })
+    
+    
+  })
+  
+
+}
+
+shinyApp(ui, server, options = list(height = 550))
+
+```
+
+***
+# Bibliographie
+
+[1] Persi Diaconis, "The Markov Chain Monte Carlo Revolution" <br/>
+https://math.uchicago.edu/~shmuel/Network-course-readings/MCMCRev.pdf
+
+[2] Jian Chen & Jeffrey S. Rosenthal, "Decrypting classical cipher text using Markov chain Monte Carlo" <br/>
+https://link.springer.com/article/10.1007/s11222-011-9232-5
+
+[3] "Text Decryption Using MCMC" <br/>
+https://www.r-bloggers.com/text-decryption-using-mcmc/
+
+***
+
+
